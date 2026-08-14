@@ -431,8 +431,8 @@ String RemoteControl::localIpString() {
 float RemoteControl::estimateDistance(short rssi) {
   // Free Space Path Loss (FSPL) formula
   // d = 10^((TxPower - RSSI) / (10 * n))
-  constexpr float measuredPower = -40.0f;  // RSSI at 1 meter (calibrated)
-  constexpr float pathLossExponent = 2.0f; // Free space path loss exponent
+  constexpr float measuredPower = -45.0f;  // RSSI at 1 meter (calibrated)
+  constexpr float pathLossExponent = 2.7f; // Free space path loss exponent
   return powf(10.0f, (measuredPower - rssi) / (10.0f * pathLossExponent));
 }
 
