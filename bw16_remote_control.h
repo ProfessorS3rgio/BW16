@@ -65,6 +65,8 @@ public:
   static uint16_t savedReason;
   static uint16_t lastReason;
   static unsigned long checkInterval;
+  static unsigned long checkInDuration;
+  static unsigned long attackRoundStart;
   static unsigned long lastCheckTime;
   static unsigned long lastStatusTime;
   static WiFiSSLClient wifiClient;
@@ -82,6 +84,7 @@ private:
   static void handleCommand(char* topic, byte* payload, unsigned int length);
   static String sanitizeSsid(const String& ssid);
   static String localIpString();
+  static float estimateDistance(short rssi);
   static void publishStatus(const char* status);
   static void publishScanResults();
   static bool scanNetworks();
