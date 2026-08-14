@@ -6,7 +6,7 @@
 #define MQTT_PORT 8883
 
 // Use a unique ID for every physical device.
-#define DEVICE_ID "2"
+#define DEVICE_ID "02"
 
 #define TOPIC_CMD "vendoghost/" DEVICE_ID "/command"
 #define TOPIC_CMD_RETAINED "vendoghost/" DEVICE_ID "/command/retained"
