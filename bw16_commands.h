@@ -30,6 +30,13 @@ struct Bw16Command {
   }
 };
 
+inline uint8_t hexCharToByte(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return 0;
+}
+
 inline bool parseMacAddress(const String &macStr, uint8_t *mac) {
   // Remove any whitespace
   String cleanMac = macStr;
@@ -45,36 +52,41 @@ inline bool parseMacAddress(const String &macStr, uint8_t *mac) {
     return false;
   }
   
-  // Check for colons at positions 2, 5, 8, 11, 14
-  for (int i = 2; i <= 14; i += 3) {
-    if (cleanMac.charAt(i) != ':') {
-      Serial.print("MAC format error at position ");
-      Serial.println(i);
-      return false;
-    }
-  }
-  
-  // Parse each hex pair
-  int values[6];
-  int result = sscanf(cleanMac.c_str(), "%x:%x:%x:%x:%x:%x",
-                      &values[0], &values[1], &values[2],
-                      &values[3], &values[4], &values[5]);
-  
-  if (result != 6) {
-    Serial.print("sscanf parsed only ");
-    Serial.print(result);
-    Serial.println(" values");
-    return false;
-  }
-  
-  // Validate and assign
+  // Manual parsing without sscanf
   for (int i = 0; i < 6; i++) {
-    if (values[i] < 0 || values[i] > 255) {
-      Serial.print("MAC value out of range: ");
-      Serial.println(values[i]);
+    int pos = i * 3;
+    
+    // Check for colon separator (except before first byte)
+    if (i > 0 && cleanMac.charAt(pos - 1) != ':') {
+      Serial.print("Missing colon at position ");
+      Serial.println(pos - 1);
       return false;
     }
-    mac[i] = (uint8_t)values[i];
+    
+    // Parse two hex characters
+    char highChar = cleanMac.charAt(pos);
+    char lowChar = cleanMac.charAt(pos + 1);
+    
+    // Validate hex characters
+    if (!((highChar >= '0' && highChar <= '9') || 
+          (highChar >= 'a' && highChar <= 'f') || 
+          (highChar >= 'A' && highChar <= 'F'))) {
+      Serial.print("Invalid hex character: '");
+      Serial.print(highChar);
+      Serial.println("'");
+      return false;
+    }
+    
+    if (!((lowChar >= '0' && lowChar <= '9') || 
+          (lowChar >= 'a' && lowChar <= 'f') || 
+          (lowChar >= 'A' && lowChar <= 'F'))) {
+      Serial.print("Invalid hex character: '");
+      Serial.print(lowChar);
+      Serial.println("'");
+      return false;
+    }
+    
+    mac[i] = (hexCharToByte(highChar) << 4) | hexCharToByte(lowChar);
   }
   
   // Debug output
@@ -130,31 +142,17 @@ inline Bw16Command parseBw16Command(String command) {
   if (command.startsWith("multi_attack:")) {
     String params = command.substring(13); // Remove "multi_attack:"
     
-    Serial.print("Multi-attack params: '");
-    Serial.print(params);
-    Serial.println("'");
-    
     // Find the commas
     int firstComma = params.indexOf(',');
     int secondComma = params.indexOf(',', firstComma + 1);
-    
-    Serial.print("First comma at: ");
-    Serial.println(firstComma);
-    Serial.print("Second comma at: ");
-    Serial.println(secondComma);
     
     if (firstComma > 0 && secondComma > firstComma + 1) {
       // Parse count
       String countStr = params.substring(0, firstComma);
       int count = countStr.toInt();
-      Serial.print("Count: ");
-      Serial.println(count);
       
       // Parse MAC address
       String macStr = params.substring(firstComma + 1, secondComma);
-      Serial.print("MAC string: '");
-      Serial.print(macStr);
-      Serial.println("'");
       
       // Parse channel and SSID
       String channelAndSsid = params.substring(secondComma + 1);
@@ -163,13 +161,6 @@ inline Bw16Command parseBw16Command(String command) {
       if (thirdComma > 0) {
         String channelStr = channelAndSsid.substring(0, thirdComma);
         String ssidStr = channelAndSsid.substring(thirdComma + 1);
-        
-        Serial.print("Channel string: '");
-        Serial.print(channelStr);
-        Serial.println("'");
-        Serial.print("SSID string: '");
-        Serial.print(ssidStr);
-        Serial.println("'");
         
         // Validate all parameters
         if (count > 0 && count <= 100 && // Limit attack count
@@ -182,16 +173,9 @@ inline Bw16Command parseBw16Command(String command) {
           cmd.targetSsid = ssidStr;
           cmd.targetSsid.trim();
           
-          Serial.println("Multi-attack command parsed successfully");
           return cmd;
-        } else {
-          Serial.println("Multi-attack validation failed");
         }
-      } else {
-        Serial.println("Could not find third comma");
       }
-    } else {
-      Serial.println("Could not find proper commas");
     }
     
     // If we get here, the multi_attack command was malformed
